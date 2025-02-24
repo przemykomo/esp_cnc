@@ -4,6 +4,7 @@
 edition = "2021"
 name = "esp_cnc"
 version = "0.1.0"
+rust-version = "1.84.1"
 
 [dependencies]
 embassy-executor = { version = "0.7.0", features = ["executor-thread"] }
