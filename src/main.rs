@@ -13,29 +13,52 @@ use embassy_sync::{blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::{
-    peripherals::Peripherals,
-    timer::timg::TimerGroup,
-    usb_serial_jtag::UsbSerialJtag,
-    gpio::{Level, Output},
+    gpio::{Level, Output}, ledc::{channel::{self, ChannelIFace}, timer::{self, TimerIFace}, LSGlobalClkSource, Ledc, LowSpeed}, peripherals::Peripherals, time::RateExtU32, timer::timg::TimerGroup, usb_serial_jtag::UsbSerialJtag
 };
 use heapless::{String, Vec};
 use static_cell::StaticCell;
 
 const MAX_BUFFER_SIZE: usize = 512;
 
-#[embassy_executor::task]
-async fn move_motor(motor: &'static Mutex<NoopRawMutex, Output<'static>>, steps: i32, mut cancel: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>) {
+struct Motor<'d> {
+    step_pin: Output<'d>,
+    direction: Output<'d>
+}
+
+#[embassy_executor::task(pool_size = 3)]
+async fn move_motor(motor: &'static Mutex<NoopRawMutex, Motor<'static>>, steps: i32, mut cancel: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>) {
     if let Ok(mut motor) = motor.try_lock() {
-        for _ in 0..steps {
+        if steps > 0 {
+            motor.direction.set_high();
+        } else {
+            motor.direction.set_low();
+        }
+
+        let steps: u64 = steps.abs().try_into().unwrap();
+        for i in 0..steps {
+            let mut delay: u64 = 200;
+            if i < 1000 {
+                delay = 1200 - i;
+            } else if steps - i < 1000 {
+                delay = 1200 - (steps - i);
+            }
             if let Some(true) = cancel.try_changed() {
                 return;
             }
-            motor.toggle();
-            Timer::after(Duration::from_millis(1)).await;
+            motor.step_pin.toggle();
+            Timer::after(Duration::from_micros(delay)).await;
         }
     } else {
         esp_println::println!("Motor is already in use!");
     }
+}
+
+#[embassy_executor::task(pool_size = 2)]
+async fn square(motor_x: &'static Mutex<NoopRawMutex, Motor<'static>>, motor_y: &'static Mutex<NoopRawMutex, Motor<'static>>, steps: i32, mut cancel: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>) {
+    move_motor(motor_x, steps, cancel).;
+    move_motor(motor_y, steps, cancel).await;
+    move_motor(motor_x, -steps, cancel).await;
+    move_motor(motor_y, -steps, cancel).await;
 }
 
 #[esp_hal_embassy::main]
@@ -46,21 +69,40 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_hal_embassy::init(timg0.timer0);
 
-    let mut led = Output::new(peripherals.GPIO8, Level::Low);
-    static MOTOR: StaticCell<Mutex<NoopRawMutex, Output<'static>>> = StaticCell::new();
-    let motor = MOTOR.init(Mutex::new(Output::new(peripherals.GPIO0, Level::Low)));
+    static MOTOR_X: StaticCell<Mutex<NoopRawMutex, Motor<'static>>> = StaticCell::new();
+    static MOTOR_Y: StaticCell<Mutex<NoopRawMutex, Motor<'static>>> = StaticCell::new();
+    let motor_x = MOTOR_X.init(Mutex::new(Motor {
+        step_pin: Output::new(peripherals.GPIO0, Level::Low),
+        direction: Output::new(peripherals.GPIO1, Level::Low),
+    }));
+
+    let motor_y = MOTOR_Y.init(Mutex::new(Motor {
+        step_pin: Output::new(peripherals.GPIO2, Level::Low),
+        direction: Output::new(peripherals.GPIO3, Level::Low),
+    }));
 
     let (mut rx, _tx) = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async().split();
 
     static CANCEL_WATCH: Watch<CriticalSectionRawMutex, bool, 2> = Watch::new();
     let cancel_sender = CANCEL_WATCH.sender();
-    //static SIGNAL: StaticCell<Signal<NoopRawMutex, String<MAX_BUFFER_SIZE>>> = StaticCell::new();
-    //let signal = &*SIGNAL.init(Signal::new());
 
-    //spawner.spawn(reader(rx, &signal, led)).unwrap();
-    //spawner.spawn(writer(tx, &signal)).unwrap();
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+    static LSTIMER: StaticCell<esp_hal::ledc::timer::Timer<'static, LowSpeed>> = StaticCell::new();
+    let lstimer = LSTIMER.init(ledc.timer::<LowSpeed>(timer::Number::Timer0));
+    lstimer.configure(timer::config::Config {
+        duty: timer::config::Duty::Duty14Bit,
+        clock_source: timer::LSClockSource::APBClk,
+        frequency: 50.Hz()
+    }).unwrap();
+    let mut channel = ledc.channel(channel::Number::Channel0, peripherals.GPIO4);
+    channel.configure(channel::config::Config {
+        timer: lstimer,
+        duty_pct: 5,
+        pin_config: channel::config::PinConfig::PushPull
+    }).unwrap();
 
-
+    let mut led = Output::new(peripherals.GPIO8, Level::Low);
     let mut rbuf = [0u8; MAX_BUFFER_SIZE];
     let mut command: String<64> = String::new();
 
@@ -84,13 +126,29 @@ async fn main(spawner: Spawner) {
                                 Timer::after(Duration::from_millis(500)).await;
                             }
                         },
-                        Some("move") => {
+                        Some("moveX") => {
                             let steps: i32 = iter.next().unwrap().parse().unwrap();
-                            spawner.spawn(move_motor(motor, steps, CANCEL_WATCH.anon_receiver())).unwrap();
+                            spawner.spawn(move_motor(motor_x, steps, CANCEL_WATCH.anon_receiver())).unwrap();
+                        },
+                        Some("moveY") => {
+                            let steps: i32 = iter.next().unwrap().parse().unwrap();
+                            spawner.spawn(move_motor(motor_y, steps, CANCEL_WATCH.anon_receiver())).unwrap();
+                        },
+                        Some("test") => {
+                            spawner.spawn(move_motor(motor_x, 20000, CANCEL_WATCH.anon_receiver())).unwrap();
+                            spawner.spawn(move_motor(motor_y, 20000, CANCEL_WATCH.anon_receiver())).unwrap();
                         },
                         Some("cancel") => {
                             cancel_sender.send(true);
                         },
+                        Some("servo") => {
+                            let angle: u8 = iter.next().unwrap().parse().unwrap();
+                            if angle > 90 {
+                                esp_println::print!("[Invalid angle!]");
+                            } else {
+                                channel.set_duty(5 + angle / 18).unwrap();
+                            }
+                        }
                         Some(_) => esp_println::println!("[Invalid command!]"),
                         None => {}
                     }
