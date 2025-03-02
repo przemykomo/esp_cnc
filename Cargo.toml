@@ -27,6 +27,7 @@ embassy-embedded-hal = "0.3.0"
 embassy-usb = "0.4.0"
 heapless = "0.8.0"
 embedded-io-async = "0.6.1"
+libm = "0.2.11"
 
 [[bin]]
 name = "esp_cnc"

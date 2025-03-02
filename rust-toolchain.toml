@@ -2,3 +2,4 @@
 
 [toolchain]
 channel = "nightly"
+versioned = "1.84.1"
