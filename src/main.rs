@@ -137,6 +137,7 @@ async fn square(
     move_motor(motor_y, -steps).await;
 }
 
+#[derive(Debug)]
 enum GCode {
     G0 { x: f32, y: f32, f: Option<f32> },
     G1 { x: f32, y: f32, f: Option<f32> },
@@ -184,6 +185,7 @@ async fn parse_gcode<'a>(
             string_buffer.extend_from_slice(&rbuf[..len]).unwrap();
             let message = String::from_utf8(string_buffer).unwrap();
             if message == "\r" {
+                esp_println::println!();
                 let mut iter = command.split(' ');
                 match iter.next() {
                     Some("G0") => {
@@ -238,6 +240,7 @@ async fn parse_gcode<'a>(
                 break;
             } else {
                 let _ = command.push_str(&message);
+                esp_println::print!("{}", message);
             }
         }
 
@@ -437,6 +440,9 @@ async fn main(spawner: Spawner) {
                         },
                         Some("run_gcode") => {
                             spawner.spawn(run_gcode(instructions, motor_x, motor_y, channel)).unwrap();
+                        },
+                        Some("debug_gcode") => {
+                            esp_println::println!("{:#?}", instructions);
                         },
                         Some(_) => esp_println::println!("[Invalid command!]"),
                         None => {}
