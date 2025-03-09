@@ -24,6 +24,7 @@ use esp_hal::{
     usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx},
     Async,
 };
+use esp_println::dbg;
 use heapless::{String, Vec};
 use libm::sqrtf;
 use static_cell::StaticCell;
@@ -93,6 +94,7 @@ async fn move_xy(
         let steps_y: u64 = steps_y.abs().try_into().unwrap();
 
         let begin = Instant::now().as_micros();
+        //dbg!(begin);
 
         let mut x: u64 = 0;
         let mut y: u64 = 0;
@@ -102,6 +104,7 @@ async fn move_xy(
             //TODO: use something more smooth than lerp, possibly smoothstep
             let expected_x: u64 = (now - begin) * steps_x / time_micros;
             let expected_y: u64 = (now - begin) * steps_y / time_micros;
+
             if expected_x > x {
                 motor_x.step_pin.set_high();
                 x += 1;
@@ -110,15 +113,15 @@ async fn move_xy(
                 motor_y.step_pin.set_high();
                 y += 1;
             }
-            Timer::after_micros(2).await;
+
+            Timer::after_micros(200).await;
             motor_x.step_pin.set_low();
             motor_y.step_pin.set_low();
 
-            if expected_x <= x && expected_y <= y {
+            Timer::after_micros(200).await;
+            if x >= steps_x && y >= steps_y {
                 break;
             }
-
-            Timer::after_micros(40).await;
         }
     } else {
         esp_println::println!("[Motor is already in use!]");
