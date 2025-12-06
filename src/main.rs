@@ -7,14 +7,14 @@ use embassy_executor::Spawner;
 use embassy_sync::{
     blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
     mutex::Mutex,
-    watch::Watch,
+    watch::{AnonReceiver, Watch},
 };
 use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     gpio::{Level, Output},
     ledc::{
-        channel::{self, ChannelIFace, Channel},
+        channel::{self, Channel, ChannelIFace},
         timer::{self, TimerIFace},
         LSGlobalClkSource, Ledc, LowSpeed,
     },
@@ -39,28 +39,65 @@ struct Motor<'d> {
 }
 
 #[embassy_executor::task(pool_size = 3)]
-async fn move_motor_task(motor: MutexMotor, steps: i32) {
-    move_motor(motor, steps).await;
+async fn move_motor_task(
+    motor: MutexMotor,
+    steps: i64,
+    recv: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
+) {
+    move_motor(motor, steps, recv).await;
 }
 //#[embassy_executor::task(pool_size = 3)]
 async fn move_motor(
     motor: MutexMotor,
-    steps: i32, /*, mut cancel: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>*/
+    steps: i64,
+    mut cancel: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
 ) {
     if let Ok(mut motor) = motor.try_lock() {
         motor.direction.set_level(Level::from(steps > 0));
 
-        let steps: u64 = steps.abs().try_into().unwrap();
+        let steps: u64 = TryInto::<u64>::try_into(steps.abs()).unwrap() * 2;
         for i in 0..steps {
             let mut delay: u64 = 200;
             if i < 1000 {
                 delay = 1200 - i;
             } else if steps - i < 1000 {
                 delay = 1200 - (steps - i);
-            } /*
-              if let Some(true) = cancel.try_changed() {
-                  return;
-              }*/
+            }
+            if let Some(true) = cancel.try_changed() {
+                return;
+            }
+            motor.step_pin.toggle();
+            Timer::after_micros(delay).await;
+        }
+    } else {
+        esp_println::println!("[Motor is already in use!]");
+    }
+}
+
+#[embassy_executor::task(pool_size = 2)]
+async fn spin(
+    motor: MutexMotor,
+    mut cancel: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
+) {
+    if let Ok(mut motor) = motor.try_lock() {
+        motor.direction.set_level(Level::Low);
+
+        // let steps: u64 = TryInto::<u64>::try_into(steps.abs()).unwrap() * 2;
+        let mut i = 0;
+        loop {
+            let mut delay: u64 = 200;
+            if i < 2000 {
+                delay = 4200 - i;
+                i += 1;
+            }
+            if let Some(true) = cancel.try_changed() {
+                break;
+            }
+            motor.step_pin.toggle();
+            Timer::after_micros(delay).await;
+        }
+        for i in 0..2000 {
+            let delay = 200 + i;
             motor.step_pin.toggle();
             Timer::after_micros(delay).await;
         }
@@ -73,8 +110,8 @@ async fn move_motor(
 async fn move_xy_task(
     motor_x: MutexMotor,
     motor_y: MutexMotor,
-    steps_x: i32,
-    steps_y: i32,
+    steps_x: i64,
+    steps_y: i64,
     time_micros: u64,
 ) {
     move_xy(motor_x, motor_y, steps_x, steps_y, time_micros).await;
@@ -83,9 +120,9 @@ async fn move_xy_task(
 async fn move_xy(
     motor_x: MutexMotor,
     motor_y: MutexMotor,
-    steps_x: i32,
-    steps_y: i32,
-    time_micros: u64,
+    steps_x: i64,
+    steps_y: i64,
+    mut time_micros: u64,
 ) {
     if let (Ok(mut motor_x), Ok(mut motor_y)) = (motor_x.try_lock(), motor_y.try_lock()) {
         motor_x.direction.set_level(Level::from(steps_x > 0));
@@ -94,6 +131,9 @@ async fn move_xy(
         let steps_y: u64 = steps_y.abs().try_into().unwrap();
 
         let begin = Instant::now().as_micros();
+        if time_micros == 0 {
+            time_micros = 1;
+        }
         //dbg!(begin);
 
         let mut x: u64 = 0;
@@ -114,11 +154,11 @@ async fn move_xy(
                 y += 1;
             }
 
-            Timer::after_micros(200).await;
+            Timer::after_micros(2).await;
             motor_x.step_pin.set_low();
             motor_y.step_pin.set_low();
 
-            Timer::after_micros(200).await;
+            Timer::after_micros(40).await;
             if x >= steps_x && y >= steps_y {
                 break;
             }
@@ -132,12 +172,13 @@ async fn move_xy(
 async fn square(
     motor_x: MutexMotor,
     motor_y: &'static Mutex<NoopRawMutex, Motor<'static>>,
-    steps: i32,
+    steps: i64,
+    recv: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
 ) {
-    move_motor(motor_x, steps).await;
-    move_motor(motor_y, steps).await;
-    move_motor(motor_x, -steps).await;
-    move_motor(motor_y, -steps).await;
+    move_motor(motor_x, steps, recv).await;
+    // move_motor(motor_y, steps, recv).await;
+    // move_motor(motor_x, -steps, recv).await;
+    // move_motor(motor_y, -steps, recv).await;
 }
 
 #[derive(Debug)]
@@ -167,17 +208,18 @@ impl Debug for GCodeParsingError {
             GCodeParsingError::MissingArgumentError => f.write_str("Missing argument error"),
             GCodeParsingError::VectorFullError => f.write_str("GCode vector is full"),
             GCodeParsingError::InvalidFloatError => f.write_str("Invalid float argument"),
-            GCodeParsingError::MutexLock => f.write_str("Can't lock the instructions mutex")
+            GCodeParsingError::MutexLock => f.write_str("Can't lock the instructions mutex"),
         }
     }
 }
 
 async fn parse_gcode<'a>(
     rx: &mut UsbSerialJtagRx<'a, Async>,
-    instructions: &'static Mutex<NoopRawMutex, Vec<GCode, 10000>>
+    instructions: &'static Mutex<NoopRawMutex, Vec<GCode, 10000>>,
 ) -> Result<(), GCodeParsingError> {
     //let mut instructions: Vec<GCode, 10000> = Vec::new();
     if let Ok(mut instructions) = instructions.try_lock() {
+        instructions.clear();
         let mut rbuf = [0u8; MAX_BUFFER_SIZE];
         let mut command: String<64> = String::new();
         loop {
@@ -197,44 +239,80 @@ async fn parse_gcode<'a>(
                         let mut f: Option<f32> = None;
                         while let Some(arg) = iter.next() {
                             if arg.starts_with("X") {
-                                x = Some(arg[1..].parse().map_err(|_| GCodeParsingError::InvalidFloatError)?);
+                                x = Some(
+                                    arg[1..]
+                                        .parse()
+                                        .map_err(|_| GCodeParsingError::InvalidFloatError)?,
+                                );
                             } else if arg.starts_with("Y") {
-                                y = Some(arg[1..].parse().map_err(|_| GCodeParsingError::InvalidFloatError)?);
+                                y = Some(
+                                    arg[1..]
+                                        .parse()
+                                        .map_err(|_| GCodeParsingError::InvalidFloatError)?,
+                                );
                             } else if arg.starts_with("F") {
-                                f = Some(arg[1..].parse().map_err(|_| GCodeParsingError::InvalidFloatError)?);
+                                f = Some(
+                                    arg[1..]
+                                        .parse()
+                                        .map_err(|_| GCodeParsingError::InvalidFloatError)?,
+                                );
                             }
                         }
 
-                        instructions.push(GCode::G0 {
-                            x: x.ok_or(GCodeParsingError::MissingArgumentError)?,
-                            y: y.ok_or(GCodeParsingError::MissingArgumentError)?,
-                            f,
-                        }).map_err(|_| GCodeParsingError::VectorFullError)?;
-                    },
+                        instructions
+                            .push(GCode::G0 {
+                                x: x.ok_or(GCodeParsingError::MissingArgumentError)?,
+                                y: y.ok_or(GCodeParsingError::MissingArgumentError)?,
+                                f,
+                            })
+                            .map_err(|_| GCodeParsingError::VectorFullError)?;
+                    }
                     Some("G1") => {
                         let mut x: Option<f32> = None;
                         let mut y: Option<f32> = None;
                         let mut f: Option<f32> = None;
                         while let Some(arg) = iter.next() {
                             if arg.starts_with("X") {
-                                x = Some(arg[1..].parse().map_err(|_| GCodeParsingError::InvalidFloatError)?);
+                                x = Some(
+                                    arg[1..]
+                                        .parse()
+                                        .map_err(|_| GCodeParsingError::InvalidFloatError)?,
+                                );
                             } else if arg.starts_with("Y") {
-                                y = Some(arg[1..].parse().map_err(|_| GCodeParsingError::InvalidFloatError)?);
+                                y = Some(
+                                    arg[1..]
+                                        .parse()
+                                        .map_err(|_| GCodeParsingError::InvalidFloatError)?,
+                                );
                             } else if arg.starts_with("F") {
-                                f = Some(arg[1..].parse().map_err(|_| GCodeParsingError::InvalidFloatError)?);
+                                f = Some(
+                                    arg[1..]
+                                        .parse()
+                                        .map_err(|_| GCodeParsingError::InvalidFloatError)?,
+                                );
                             }
                         }
 
-                        instructions.push(GCode::G1 {
-                            x: x.ok_or(GCodeParsingError::MissingArgumentError)?,
-                            y: y.ok_or(GCodeParsingError::MissingArgumentError)?,
-                            f,
-                        }).map_err(|_| GCodeParsingError::VectorFullError)?;
-                    },
-                    Some("G90") => instructions.push(GCode::G90).map_err(|_| GCodeParsingError::VectorFullError)?,
-                    Some("G91") => instructions.push(GCode::G91).map_err(|_| GCodeParsingError::VectorFullError)?,
-                    Some("M3") => instructions.push(GCode::M3).map_err(|_| GCodeParsingError::VectorFullError)?,
-                    Some("M5") => instructions.push(GCode::M5).map_err(|_| GCodeParsingError::VectorFullError)?,
+                        instructions
+                            .push(GCode::G1 {
+                                x: x.ok_or(GCodeParsingError::MissingArgumentError)?,
+                                y: y.ok_or(GCodeParsingError::MissingArgumentError)?,
+                                f,
+                            })
+                            .map_err(|_| GCodeParsingError::VectorFullError)?;
+                    }
+                    Some("G90") => instructions
+                        .push(GCode::G90)
+                        .map_err(|_| GCodeParsingError::VectorFullError)?,
+                    Some("G91") => instructions
+                        .push(GCode::G91)
+                        .map_err(|_| GCodeParsingError::VectorFullError)?,
+                    Some("M3") => instructions
+                        .push(GCode::M3)
+                        .map_err(|_| GCodeParsingError::VectorFullError)?,
+                    Some("M5") => instructions
+                        .push(GCode::M5)
+                        .map_err(|_| GCodeParsingError::VectorFullError)?,
                     Some(_) => return Err(GCodeParsingError::ParsingError),
                     None => {}
                 }
@@ -253,54 +331,94 @@ async fn parse_gcode<'a>(
     }
 }
 
-const MM_PER_REVOLUTION: f32 = 1.25;
-const STEPS_PER_REVOLUTION: f32 = 200.0 * 16.0;
-const STEPS_PER_MM: f32 = STEPS_PER_REVOLUTION / MM_PER_REVOLUTION;
+//const MM_PER_REVOLUTION: f32 = 1.25;
+//const STEPS_PER_REVOLUTION: f32 = 200.0 * 16.0;
+//const STEPS_PER_MM: f32 = STEPS_PER_REVOLUTION / MM_PER_REVOLUTION;
+const STEPS_PER_MM: f32 = 2576.37099742362900257638;
 
 #[embassy_executor::task]
-async fn run_gcode(instructions: &'static Mutex<NoopRawMutex, Vec<GCode, 10000>>, motor_x: MutexMotor, motor_y: MutexMotor, pwm_channel: &'static Mutex<NoopRawMutex, Channel<'static, LowSpeed>>) {
+async fn run_gcode(
+    instructions: &'static Mutex<NoopRawMutex, Vec<GCode, 10000>>,
+    motor_x: MutexMotor,
+    motor_y: MutexMotor,
+    pwm_channel: &'static Mutex<NoopRawMutex, Channel<'static, LowSpeed>>,
+) {
     if let (Ok(instructions), Ok(pwm_channel)) = (instructions.try_lock(), pwm_channel.try_lock()) {
         let mut x_pos: f32 = 0.0;
         let mut y_pos: f32 = 0.0;
         let mut absolute_position: bool = true;
-        let mut speed_mm_per_min: f32 = 300.0;
+        let mut speed_mm_per_min: f32 = 50.0;
 
         for instruction in instructions.iter() {
+            dbg!(instruction);
             match instruction {
-                GCode::G0 { x: x_move, y: y_move, f } => {
-                    let x = if absolute_position {x_move - x_pos} else {*x_move};
-                    let y = if absolute_position {y_move - y_pos} else {*y_move};
-                    let steps_x = (x * STEPS_PER_MM) as i32;
-                    let steps_y = (y * STEPS_PER_MM) as i32;
+                GCode::G0 {
+                    x: x_move,
+                    y: y_move,
+                    f,
+                } => {
+                    let x = if absolute_position {
+                        *x_move - x_pos
+                    } else {
+                        *x_move
+                    };
+                    let y = if absolute_position {
+                        *y_move - y_pos
+                    } else {
+                        *y_move
+                    };
+                    let steps_x = (x * STEPS_PER_MM) as i64;
+                    let steps_y = (y * STEPS_PER_MM) as i64;
                     if let Some(f) = f {
                         speed_mm_per_min = *f;
                     }
 
-                    let length = sqrtf(x*x + y*y);
+                    let length = sqrtf(x * x + y * y);
                     let time_micros = (length / speed_mm_per_min * 60000000.0) as u64;
+                    dbg!(length, time_micros, x_pos, y_pos);
                     move_xy(motor_x, motor_y, steps_x, steps_y, time_micros).await;
-                    x_pos += x_move;
-                    y_pos += y_move;
-                },
-                GCode::G1 { x: x_move, y: y_move, f } => {
-                    let x = if absolute_position {x_move - x_pos} else {*x_move};
-                    let y = if absolute_position {y_move - y_pos} else {*y_move};
-                    let steps_x = (x * STEPS_PER_MM) as i32;
-                    let steps_y = (y * STEPS_PER_MM) as i32;
+                    x_pos += x;
+                    y_pos += y;
+                }
+                GCode::G1 {
+                    x: x_move,
+                    y: y_move,
+                    f,
+                } => {
+                    let x = if absolute_position {
+                        x_move - x_pos
+                    } else {
+                        *x_move
+                    };
+                    let y = if absolute_position {
+                        y_move - y_pos
+                    } else {
+                        *y_move
+                    };
+                    let steps_x = (x * STEPS_PER_MM) as i64;
+                    let steps_y = (y * STEPS_PER_MM) as i64;
                     if let Some(f) = f {
                         speed_mm_per_min = *f;
                     }
 
-                    let length = sqrtf(x*x + y*y);
+                    let length = sqrtf(x * x + y * y);
                     let time_micros = (length / speed_mm_per_min * 60000000.0) as u64;
+                    dbg!(x, y, steps_x, steps_y, x_pos, y_pos);
                     move_xy(motor_x, motor_y, steps_x, steps_y, time_micros).await;
-                    x_pos += x_move;
-                    y_pos += y_move;
-                },
+                    x_pos += x;
+                    y_pos += y;
+                }
                 GCode::G90 => absolute_position = true,
                 GCode::G91 => absolute_position = false,
-                GCode::M3 => pwm_channel.set_duty(5).unwrap(),
-                GCode::M5 => pwm_channel.set_duty(10).unwrap()
+                GCode::M3 => {
+                    pwm_channel.set_duty(5).unwrap();
+                    Timer::after_millis(200).await;
+                }
+                GCode::M5 => {
+                    //off
+                    pwm_channel.set_duty(10).unwrap();
+                    Timer::after_millis(200).await;
+                }
             }
         }
     } else {
@@ -319,13 +437,13 @@ async fn main(spawner: Spawner) {
     static MOTOR_X: StaticCell<Mutex<NoopRawMutex, Motor<'static>>> = StaticCell::new();
     static MOTOR_Y: StaticCell<Mutex<NoopRawMutex, Motor<'static>>> = StaticCell::new();
     let motor_x = MOTOR_X.init(Mutex::new(Motor {
-        step_pin: Output::new(peripherals.GPIO0, Level::Low),
-        direction: Output::new(peripherals.GPIO1, Level::Low),
+        step_pin: Output::new(peripherals.GPIO20, Level::Low),
+        direction: Output::new(peripherals.GPIO21, Level::Low),
     }));
 
     let motor_y = MOTOR_Y.init(Mutex::new(Motor {
-        step_pin: Output::new(peripherals.GPIO2, Level::Low),
-        direction: Output::new(peripherals.GPIO3, Level::Low),
+        step_pin: Output::new(peripherals.GPIO9, Level::Low),
+        direction: Output::new(peripherals.GPIO10, Level::Low),
     }));
 
     let (mut rx, _tx) = UsbSerialJtag::new(peripherals.USB_DEVICE)
@@ -334,6 +452,7 @@ async fn main(spawner: Spawner) {
 
     static CANCEL_WATCH: Watch<CriticalSectionRawMutex, bool, 2> = Watch::new();
     let cancel_sender = CANCEL_WATCH.sender();
+    // let cancel_rec = CANCEL_WATCH.receiver();
 
     static INSTRUCTIONS: StaticCell<Mutex<NoopRawMutex, Vec<GCode, 10000>>> = StaticCell::new();
     let instructions = INSTRUCTIONS.init(Mutex::new(Vec::new()));
@@ -350,11 +469,17 @@ async fn main(spawner: Spawner) {
         })
         .unwrap();
 
-    static PWM_CHANNEL: StaticCell<Mutex<NoopRawMutex, Channel<'static, LowSpeed>>> = StaticCell::new();
-    let channel = PWM_CHANNEL.init(Mutex::new(ledc.channel(channel::Number::Channel0, peripherals.GPIO4)));
-    channel.lock().await.configure(channel::config::Config {
+    static PWM_CHANNEL: StaticCell<Mutex<NoopRawMutex, Channel<'static, LowSpeed>>> =
+        StaticCell::new();
+    let channel = PWM_CHANNEL.init(Mutex::new(
+        ledc.channel(channel::Number::Channel0, peripherals.GPIO4),
+    ));
+    channel
+        .lock()
+        .await
+        .configure(channel::config::Config {
             timer: lstimer,
-            duty_pct: 5,
+            duty_pct: 10,
             pin_config: channel::config::PinConfig::PushPull,
         })
         .unwrap();
@@ -376,29 +501,55 @@ async fn main(spawner: Spawner) {
                     match iter.next() {
                         Some("led") => led.toggle(),
                         Some("blink") => {
-                            let num: i32 = iter.next().unwrap().parse().unwrap();
+                            let num: i64 = iter.next().unwrap().parse().unwrap();
                             for _ in 0..num {
                                 led.toggle();
                                 Timer::after(Duration::from_millis(500)).await;
                             }
                         }
+                        Some("spin") => {
+                            spawner
+                                .spawn(spin(
+                                    motor_x,
+                                    CANCEL_WATCH.anon_receiver(),
+                                ))
+                                .unwrap();
+                        }
                         Some("moveX") => {
-                            let steps: i32 = iter.next().unwrap().parse().unwrap();
+                            let steps: i64 = iter.next().unwrap().parse().unwrap();
                             spawner
                                 .spawn(move_motor_task(
-                                    motor_x, steps, /*, CANCEL_WATCH.anon_receiver()*/
+                                    motor_x,
+                                    steps,
+                                    CANCEL_WATCH.anon_receiver(),
                                 ))
                                 .unwrap();
                         }
                         Some("moveY") => {
-                            let steps: i32 = iter.next().unwrap().parse().unwrap();
-                            spawner.spawn(move_motor_task(motor_y, steps)).unwrap();
+                            let steps: i64 = iter.next().unwrap().parse().unwrap();
+                            spawner
+                                .spawn(move_motor_task(
+                                    motor_y,
+                                    steps,
+                                    CANCEL_WATCH.anon_receiver(),
+                                ))
+                                .unwrap();
                         }
                         Some("test") => {
-                            spawner.spawn(square(motor_x, motor_y, 20000)).unwrap();
+                            spawner
+                                .spawn(square(
+                                    motor_x,
+                                    motor_y,
+                                    20000,
+                                    CANCEL_WATCH.anon_receiver(),
+                                ))
+                                .unwrap();
                         }
                         Some("cancel") => {
                             cancel_sender.send(true);
+                        }
+                        Some("continue") => {
+                            cancel_sender.send(false);
                         }
                         Some("servo") => {
                             if let Ok(channel) = channel.try_lock() {
@@ -413,8 +564,12 @@ async fn main(spawner: Spawner) {
                             }
                         }
                         Some("move") => {
-                            let steps_x: i32 = iter.next().unwrap().parse().unwrap();
-                            let steps_y: i32 = iter.next().unwrap().parse().unwrap();
+                            let steps_x: i64 = (iter.next().unwrap().parse::<f32>().unwrap()
+                                * STEPS_PER_MM)
+                                as i64;
+                            let steps_y: i64 = (iter.next().unwrap().parse::<f32>().unwrap()
+                                * STEPS_PER_MM)
+                                as i64;
                             const TIME_PER_STEP_MICROS: u64 = 200;
                             let length: u64 = (steps_x * steps_x + steps_y * steps_y)
                                 .isqrt()
@@ -436,17 +591,21 @@ async fn main(spawner: Spawner) {
                             );
                             match parse_gcode(&mut rx, instructions).await {
                                 Ok(()) => {
-                                    esp_println::println!("[GCode has been parsed without errors.]");
-                                },
-                                Err(err) => esp_println::println!("[{:?}]", err)
+                                    esp_println::println!(
+                                        "[GCode has been parsed without errors.]"
+                                    );
+                                }
+                                Err(err) => esp_println::println!("[{:?}]", err),
                             }
-                        },
+                        }
                         Some("run_gcode") => {
-                            spawner.spawn(run_gcode(instructions, motor_x, motor_y, channel)).unwrap();
-                        },
+                            spawner
+                                .spawn(run_gcode(instructions, motor_x, motor_y, channel))
+                                .unwrap();
+                        }
                         Some("debug_gcode") => {
                             esp_println::println!("{:#?}", instructions);
-                        },
+                        }
                         Some(_) => esp_println::println!("[Invalid command!]"),
                         None => {}
                     }
