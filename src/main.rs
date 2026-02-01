@@ -42,15 +42,15 @@ struct Motor<'d> {
 async fn move_motor_task(
     motor: MutexMotor,
     steps: i64,
-    recv: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
+    mut recv: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
 ) {
-    move_motor(motor, steps, recv).await;
+    move_motor(motor, steps, &mut recv).await;
 }
 //#[embassy_executor::task(pool_size = 3)]
 async fn move_motor(
     motor: MutexMotor,
     steps: i64,
-    mut cancel: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
+    cancel: &mut AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
 ) {
     if let Ok(mut motor) = motor.try_lock() {
         motor.direction.set_level(Level::from(steps > 0));
@@ -124,61 +124,62 @@ async fn move_xy(
     steps_y: i64,
     mut time_micros: u64,
 ) {
-    if let (Ok(mut motor_x), Ok(mut motor_y)) = (motor_x.try_lock(), motor_y.try_lock()) {
-        motor_x.direction.set_level(Level::from(steps_x > 0));
-        motor_y.direction.set_level(Level::from(steps_y > 0));
-        let steps_x: u64 = steps_x.abs().try_into().unwrap();
-        let steps_y: u64 = steps_y.abs().try_into().unwrap();
-
-        let begin = Instant::now().as_micros();
-        if time_micros == 0 {
-            time_micros = 1;
-        }
-        //dbg!(begin);
-
-        let mut x: u64 = 0;
-        let mut y: u64 = 0;
-
-        loop {
-            let now = Instant::now().as_micros();
-            //TODO: use something more smooth than lerp, possibly smoothstep
-            let expected_x: u64 = (now - begin) * steps_x / time_micros;
-            let expected_y: u64 = (now - begin) * steps_y / time_micros;
-
-            if expected_x > x {
-                motor_x.step_pin.set_high();
-                x += 1;
-            }
-            if expected_y > y {
-                motor_y.step_pin.set_high();
-                y += 1;
-            }
-
-            Timer::after_micros(2).await;
-            motor_x.step_pin.set_low();
-            motor_y.step_pin.set_low();
-
-            Timer::after_micros(40).await;
-            if x >= steps_x && y >= steps_y {
-                break;
-            }
-        }
-    } else {
+    let (Ok(mut motor_x), Ok(mut motor_y)) = (motor_x.try_lock(), motor_y.try_lock()) else {
         esp_println::println!("[Motor is already in use!]");
+        return;
+    };
+
+    motor_x.direction.set_level(Level::from(steps_x > 0));
+    motor_y.direction.set_level(Level::from(steps_y > 0));
+    let steps_x: u64 = steps_x.abs().try_into().unwrap();
+    let steps_y: u64 = steps_y.abs().try_into().unwrap();
+
+    let begin = Instant::now().as_micros();
+    if time_micros == 0 {
+        time_micros = 1;
+    }
+
+    let mut x: u64 = 0;
+    let mut y: u64 = 0;
+
+    loop {
+        let now = Instant::now().as_micros();
+        //TODO: use something more smooth than lerp, possibly smoothstep
+        let expected_x: u64 = (now - begin) * steps_x / time_micros;
+        let expected_y: u64 = (now - begin) * steps_y / time_micros;
+
+        if expected_x > x {
+            motor_x.step_pin.set_high();
+            x += 1;
+        }
+        if expected_y > y {
+            motor_y.step_pin.set_high();
+            y += 1;
+        }
+
+        Timer::after_micros(2).await;
+        motor_x.step_pin.set_low();
+        motor_y.step_pin.set_low();
+
+        Timer::after_micros(40).await; // TODO: Possibly changing this to 2us would help with the
+                                       // jitter
+        if x >= steps_x && y >= steps_y {
+            break;
+        }
     }
 }
 
 #[embassy_executor::task(pool_size = 2)]
 async fn square(
     motor_x: MutexMotor,
-    motor_y: &'static Mutex<NoopRawMutex, Motor<'static>>,
+    motor_y: MutexMotor,
     steps: i64,
-    recv: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
+    mut recv: AnonReceiver<'static, CriticalSectionRawMutex, bool, 2>,
 ) {
-    move_motor(motor_x, steps, recv).await;
-    // move_motor(motor_y, steps, recv).await;
-    // move_motor(motor_x, -steps, recv).await;
-    // move_motor(motor_y, -steps, recv).await;
+    move_motor(motor_x, steps, &mut recv).await;
+    move_motor(motor_y, steps, &mut recv).await;
+    move_motor(motor_x, -steps, &mut recv).await;
+    move_motor(motor_y, -steps, &mut recv).await;
 }
 
 #[derive(Debug)]
@@ -343,86 +344,88 @@ async fn run_gcode(
     motor_y: MutexMotor,
     pwm_channel: &'static Mutex<NoopRawMutex, Channel<'static, LowSpeed>>,
 ) {
-    if let (Ok(instructions), Ok(pwm_channel)) = (instructions.try_lock(), pwm_channel.try_lock()) {
-        let mut x_pos: f32 = 0.0;
-        let mut y_pos: f32 = 0.0;
-        let mut absolute_position: bool = true;
-        let mut speed_mm_per_min: f32 = 50.0;
+    let (Ok(instructions), Ok(pwm_channel)) = (instructions.try_lock(), pwm_channel.try_lock())
+    else {
+        esp_println::println!("Can't lock the mutex");
+        return;
+    };
 
-        for instruction in instructions.iter() {
-            dbg!(instruction);
-            match instruction {
-                GCode::G0 {
-                    x: x_move,
-                    y: y_move,
-                    f,
-                } => {
-                    let x = if absolute_position {
-                        *x_move - x_pos
-                    } else {
-                        *x_move
-                    };
-                    let y = if absolute_position {
-                        *y_move - y_pos
-                    } else {
-                        *y_move
-                    };
-                    let steps_x = (x * STEPS_PER_MM) as i64;
-                    let steps_y = (y * STEPS_PER_MM) as i64;
-                    if let Some(f) = f {
-                        speed_mm_per_min = *f;
-                    }
+    let mut x_pos: f32 = 0.0;
+    let mut y_pos: f32 = 0.0;
+    let mut absolute_position: bool = true;
+    let mut speed_mm_per_min: f32 = 50.0;
 
-                    let length = sqrtf(x * x + y * y);
-                    let time_micros = (length / speed_mm_per_min * 60000000.0) as u64;
-                    dbg!(length, time_micros, x_pos, y_pos);
-                    move_xy(motor_x, motor_y, steps_x, steps_y, time_micros).await;
-                    x_pos += x;
-                    y_pos += y;
+    for instruction in instructions.iter() {
+        dbg!(instruction);
+        match instruction {
+            GCode::G0 {
+                x: x_move,
+                y: y_move,
+                f,
+            } => {
+                let x = if absolute_position {
+                    *x_move - x_pos
+                } else {
+                    *x_move
+                };
+                let y = if absolute_position {
+                    *y_move - y_pos
+                } else {
+                    *y_move
+                };
+                let steps_x = (x * STEPS_PER_MM) as i64;
+                let steps_y = (y * STEPS_PER_MM) as i64;
+                if let Some(f) = f {
+                    speed_mm_per_min = *f;
                 }
-                GCode::G1 {
-                    x: x_move,
-                    y: y_move,
-                    f,
-                } => {
-                    let x = if absolute_position {
-                        x_move - x_pos
-                    } else {
-                        *x_move
-                    };
-                    let y = if absolute_position {
-                        y_move - y_pos
-                    } else {
-                        *y_move
-                    };
-                    let steps_x = (x * STEPS_PER_MM) as i64;
-                    let steps_y = (y * STEPS_PER_MM) as i64;
-                    if let Some(f) = f {
-                        speed_mm_per_min = *f;
-                    }
 
-                    let length = sqrtf(x * x + y * y);
-                    let time_micros = (length / speed_mm_per_min * 60000000.0) as u64;
-                    dbg!(x, y, steps_x, steps_y, x_pos, y_pos);
-                    move_xy(motor_x, motor_y, steps_x, steps_y, time_micros).await;
-                    x_pos += x;
-                    y_pos += y;
+                let length = sqrtf(x * x + y * y);
+                let time_micros = (length / speed_mm_per_min * 60000000.0) as u64;
+                dbg!(length, time_micros, x_pos, y_pos);
+                move_xy(motor_x, motor_y, steps_x, steps_y, time_micros).await;
+                x_pos += x;
+                y_pos += y;
+            }
+            GCode::G1 {
+                x: x_move,
+                y: y_move,
+                f,
+            } => {
+                let x = if absolute_position {
+                    x_move - x_pos
+                } else {
+                    *x_move
+                };
+                let y = if absolute_position {
+                    y_move - y_pos
+                } else {
+                    *y_move
+                };
+                let steps_x = (x * STEPS_PER_MM) as i64;
+                let steps_y = (y * STEPS_PER_MM) as i64;
+                if let Some(f) = f {
+                    speed_mm_per_min = *f;
                 }
-                GCode::G90 => absolute_position = true,
-                GCode::G91 => absolute_position = false,
-                GCode::M3 => {
-                    pwm_channel.set_duty(5).unwrap();
-                    Timer::after_millis(200).await;
-                }
-                GCode::M5 => {
-                    //off
-                    pwm_channel.set_duty(10).unwrap();
-                    Timer::after_millis(200).await;
-                }
+
+                let length = sqrtf(x * x + y * y);
+                let time_micros = (length / speed_mm_per_min * 60000000.0) as u64;
+                dbg!(x, y, steps_x, steps_y, x_pos, y_pos);
+                move_xy(motor_x, motor_y, steps_x, steps_y, time_micros).await;
+                x_pos += x;
+                y_pos += y;
+            }
+            GCode::G90 => absolute_position = true,
+            GCode::G91 => absolute_position = false,
+            GCode::M3 => {
+                pwm_channel.set_duty(5).unwrap();
+                Timer::after_millis(200).await;
+            }
+            GCode::M5 => {
+                //off
+                pwm_channel.set_duty(10).unwrap();
+                Timer::after_millis(200).await;
             }
         }
-    } else {
-        esp_println::println!("Can't lock the mutex");
     }
 }
 
@@ -489,138 +492,126 @@ async fn main(spawner: Spawner) {
     let mut command: String<64> = String::new();
 
     loop {
-        let r = embedded_io_async::Read::read(&mut rx, &mut rbuf).await;
-        match r {
-            Ok(len) => {
-                let mut string_buffer: Vec<_, MAX_BUFFER_SIZE> = Vec::new();
-                string_buffer.extend_from_slice(&rbuf[..len]).unwrap();
-                let message = String::from_utf8(string_buffer).unwrap();
-                if message == "\r" {
-                    esp_println::println!();
-                    let mut iter = command.split(' ');
-                    match iter.next() {
-                        Some("led") => led.toggle(),
-                        Some("blink") => {
-                            let num: i64 = iter.next().unwrap().parse().unwrap();
-                            for _ in 0..num {
-                                led.toggle();
-                                Timer::after(Duration::from_millis(500)).await;
-                            }
+        let Ok(len) = embedded_io_async::Read::read(&mut rx, &mut rbuf).await;
+        let mut string_buffer: Vec<_, MAX_BUFFER_SIZE> = Vec::new();
+        string_buffer.extend_from_slice(&rbuf[..len]).unwrap();
+        let message = String::from_utf8(string_buffer).unwrap();
+        if message == "\r" {
+            esp_println::println!();
+            let mut iter = command.split(' ');
+            match iter.next() {
+                Some("led") => led.toggle(),
+                Some("blink") => {
+                    let num: i64 = iter.next().unwrap().parse().unwrap();
+                    for _ in 0..num {
+                        led.toggle();
+                        Timer::after(Duration::from_millis(500)).await;
+                    }
+                }
+                Some("spin") => {
+                    spawner
+                        .spawn(spin(motor_x, CANCEL_WATCH.anon_receiver()))
+                        .unwrap();
+                }
+                Some("moveX") => {
+                    let steps: i64 = iter.next().unwrap().parse().unwrap();
+                    spawner
+                        .spawn(move_motor_task(
+                            motor_x,
+                            steps,
+                            CANCEL_WATCH.anon_receiver(),
+                        ))
+                        .unwrap();
+                }
+                Some("moveY") => {
+                    let steps: i64 = iter.next().unwrap().parse().unwrap();
+                    spawner
+                        .spawn(move_motor_task(
+                            motor_y,
+                            steps,
+                            CANCEL_WATCH.anon_receiver(),
+                        ))
+                        .unwrap();
+                }
+                Some("test") => {
+                    spawner
+                        .spawn(square(
+                            motor_x,
+                            motor_y,
+                            20000,
+                            CANCEL_WATCH.anon_receiver(),
+                        ))
+                        .unwrap();
+                }
+                Some("cancel") => {
+                    cancel_sender.send(true);
+                }
+                Some("continue") => {
+                    cancel_sender.send(false);
+                }
+                Some("servo") => {
+                    if let Ok(channel) = channel.try_lock() {
+                        let angle: u8 = iter.next().unwrap().parse().unwrap();
+                        if angle > 90 {
+                            esp_println::print!("[Invalid angle!]");
+                        } else {
+                            channel.set_duty(5 + angle / 18).unwrap();
                         }
-                        Some("spin") => {
-                            spawner
-                                .spawn(spin(
-                                    motor_x,
-                                    CANCEL_WATCH.anon_receiver(),
-                                ))
-                                .unwrap();
-                        }
-                        Some("moveX") => {
-                            let steps: i64 = iter.next().unwrap().parse().unwrap();
-                            spawner
-                                .spawn(move_motor_task(
-                                    motor_x,
-                                    steps,
-                                    CANCEL_WATCH.anon_receiver(),
-                                ))
-                                .unwrap();
-                        }
-                        Some("moveY") => {
-                            let steps: i64 = iter.next().unwrap().parse().unwrap();
-                            spawner
-                                .spawn(move_motor_task(
-                                    motor_y,
-                                    steps,
-                                    CANCEL_WATCH.anon_receiver(),
-                                ))
-                                .unwrap();
-                        }
-                        Some("test") => {
-                            spawner
-                                .spawn(square(
-                                    motor_x,
-                                    motor_y,
-                                    20000,
-                                    CANCEL_WATCH.anon_receiver(),
-                                ))
-                                .unwrap();
-                        }
-                        Some("cancel") => {
-                            cancel_sender.send(true);
-                        }
-                        Some("continue") => {
-                            cancel_sender.send(false);
-                        }
-                        Some("servo") => {
-                            if let Ok(channel) = channel.try_lock() {
-                                let angle: u8 = iter.next().unwrap().parse().unwrap();
-                                if angle > 90 {
-                                    esp_println::print!("[Invalid angle!]");
-                                } else {
-                                    channel.set_duty(5 + angle / 18).unwrap();
-                                }
-                            } else {
-                                esp_println::println!("[Can't lock pwm channel mutex]");
-                            }
-                        }
-                        Some("move") => {
-                            let steps_x: i64 = (iter.next().unwrap().parse::<f32>().unwrap()
-                                * STEPS_PER_MM)
-                                as i64;
-                            let steps_y: i64 = (iter.next().unwrap().parse::<f32>().unwrap()
-                                * STEPS_PER_MM)
-                                as i64;
-                            const TIME_PER_STEP_MICROS: u64 = 200;
-                            let length: u64 = (steps_x * steps_x + steps_y * steps_y)
-                                .isqrt()
-                                .try_into()
-                                .unwrap();
-                            spawner
-                                .spawn(move_xy_task(
-                                    motor_x,
-                                    motor_y,
-                                    steps_x,
-                                    steps_y,
-                                    length * TIME_PER_STEP_MICROS,
-                                ))
-                                .unwrap();
-                        }
-                        Some("gcode") => {
-                            esp_println::println!(
+                    } else {
+                        esp_println::println!("[Can't lock pwm channel mutex]");
+                    }
+                }
+                Some("move") => {
+                    let steps_x: i64 =
+                        (iter.next().unwrap().parse::<f32>().unwrap() * STEPS_PER_MM) as i64;
+                    let steps_y: i64 =
+                        (iter.next().unwrap().parse::<f32>().unwrap() * STEPS_PER_MM) as i64;
+                    const TIME_PER_STEP_MICROS: u64 = 200;
+                    let length: u64 = (steps_x * steps_x + steps_y * steps_y)
+                        .isqrt()
+                        .try_into()
+                        .unwrap();
+                    spawner
+                        .spawn(move_xy_task(
+                            motor_x,
+                            motor_y,
+                            steps_x,
+                            steps_y,
+                            length * TIME_PER_STEP_MICROS,
+                        ))
+                        .unwrap();
+                }
+                Some("gcode") => {
+                    esp_println::println!(
                                 "[Paste GCode, end with $ after a newline. Supports G0, G1, G90, G91, M3, M5.]"
                             );
-                            match parse_gcode(&mut rx, instructions).await {
-                                Ok(()) => {
-                                    esp_println::println!(
-                                        "[GCode has been parsed without errors.]"
-                                    );
-                                }
-                                Err(err) => esp_println::println!("[{:?}]", err),
-                            }
+                    match parse_gcode(&mut rx, instructions).await {
+                        Ok(()) => {
+                            esp_println::println!("[GCode has been parsed without errors.]");
                         }
-                        Some("run_gcode") => {
-                            spawner
-                                .spawn(run_gcode(instructions, motor_x, motor_y, channel))
-                                .unwrap();
-                        }
-                        Some("debug_gcode") => {
-                            esp_println::println!("{:#?}", instructions);
-                        }
-                        Some(_) => esp_println::println!("[Invalid command!]"),
-                        None => {}
+                        Err(err) => esp_println::println!("[{:?}]", err),
                     }
-                    command.clear();
-                } else if message.as_bytes() == [8] {
-                    let len = command.len();
-                    command.pop();
-                    esp_println::print!("\r{:len$}\r{command}", "");
-                } else {
-                    let _ = command.push_str(&message);
-                    esp_println::print!("{}", message);
                 }
+                Some("run_gcode") => {
+                    spawner
+                        .spawn(run_gcode(instructions, motor_x, motor_y, channel))
+                        .unwrap();
+                }
+                Some("debug_gcode") => {
+                    esp_println::println!("{:#?}", instructions);
+                }
+                Some(_) => esp_println::println!("[Invalid command!]"),
+                None => {}
             }
-            //#[allow(unreachable_patterns)]
-            Err(e) => esp_println::println!("[RX Error: {:?}]", e),
+            command.clear();
+        } else if message.as_bytes() == [8] {
+            let len = command.len();
+            if command.pop().is_some() {
+                esp_println::print!("\r{:len$}\r{command}", "");
+            }
+        } else {
+            let _ = command.push_str(&message);
+            esp_println::print!("{}", message);
         }
     }
 }
